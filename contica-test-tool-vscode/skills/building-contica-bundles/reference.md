@@ -40,7 +40,7 @@ Integration (`INT0542/manifest.json`), as the build script writes it:
   "integrationName": "Order intake",
   "fetchedAt": "2026-10-11T09:30:00Z",
   "fetchedBy": "build-INT0542.ps1",
-  "sourceProvenance": { "kind": "scripted", "rootPath": "" },
+  "sourceProvenance": { "kind": "scripted", "rootPath": "", "managedFiles": [ "code/connections.json", "..." ] },
   "sharedFiles": {
     "documentation": [ { "path": "documentation/INT0542 Order intake.md", "purpose": "main-documentation" } ],
     "standards":     [ { "path": "standards/Error handling guide.md", "purpose": "error-handling" } ],
@@ -84,6 +84,8 @@ and an `entityFiles` object. The folder names, not `integrationId` and
 `entityId`, decide which integration and entity it is. `direction` follows
 the i/o letter when left out. The integration manifest is optional, but
 without it nothing is shared.
+
+`sourceProvenance.managedFiles` is the build script's own record of the files it copied, so a file taken out of its CONFIG is removed from the manifest and the bundle on the next run. The tool keeps it but does not read it.
 
 The tool writes to entity manifests too: `resource` (the Azure workflow it
 tests against), examples added with **Add Example**, and `format`. The build

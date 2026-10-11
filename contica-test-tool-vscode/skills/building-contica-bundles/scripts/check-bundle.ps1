@@ -164,8 +164,11 @@ function Find-PersonalData([string]$text) {
         $digits = $m.Value -replace '[ -]', ''
         if ($digits -match '^(4|5[1-5]|2[2-7]|3[47]|6)' -and (Test-Luhn $digits)) { $found.Add("card number $($m.Value)") }
     }
-    foreach ($m in [regex]::Matches($text, '\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b')) {
-        $iban = $m.Value
+    # The tool's own pattern: capital letters, optionally written in groups
+    # of four separated by single spaces ("GB82 WEST 1234 ...").
+    foreach ($m in [regex]::Matches($text, '(?<![A-Z0-9])([A-Z]{2}\d{2}(?: ?[A-Z0-9]{4}){2,7}(?: ?[A-Z0-9]{1,3})?)(?![A-Z0-9])')) {
+        $iban = $m.Groups[1].Value.Replace(' ', '')
+        if ($iban.Length -lt 15 -or $iban.Length -gt 34) { continue }
         $moved = $iban.Substring(4) + $iban.Substring(0, 4)
         $numeric = -join ($moved.ToCharArray() | ForEach-Object { if ([char]::IsLetter($_)) { [int][char]$_ - 55 } else { $_ } })
         $remainder = 0
@@ -175,33 +178,89 @@ function Find-PersonalData([string]$text) {
     return $found
 }
 
-# Reads sheet names and the words used in an .xlsx without Excel: an .xlsx
-# is a zip of XML files.
+# Reads an .xlsx without Excel (it is a zip of XML files): every sheet's name
+# and, per sheet, the cell text of its first 8 rows, where the tool looks for
+# the column headers. Returns a list of @{ Name; HeaderRows }.
 function Get-XlsxInfo([string]$path) {
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $zip = [System.IO.Compression.ZipFile]::OpenRead($path)
     try {
-        $sheets = @()
-        $cells = New-Object System.Collections.Generic.List[string]
+        $files = @{}
         foreach ($entry in $zip.Entries) {
-            # Cell text sits in sharedStrings.xml, or, for files written by
-            # some tools, in the sheet itself: <is><t>...</t></is> for inline
-            # strings, <v>...</v> for formula-string cells (t="str").
-            $isSheet = $entry.FullName -like 'xl/worksheets/*.xml'
-            if ($entry.FullName -eq 'xl/workbook.xml' -or $entry.FullName -eq 'xl/sharedStrings.xml' -or $isSheet) {
-                $reader = New-Object System.IO.StreamReader($entry.Open())
-                try { $xml = $reader.ReadToEnd() } finally { $reader.Dispose() }
-                if ($entry.FullName -eq 'xl/workbook.xml') {
-                    $sheets = [regex]::Matches($xml, '<sheet [^>]*name="([^"]+)"') | ForEach-Object { [System.Net.WebUtility]::HtmlDecode($_.Groups[1].Value) }
-                } else {
-                    foreach ($match in [regex]::Matches($xml, '<([tv])(?:\s[^>]*)?>([^<]*)</\1>')) {
-                        $cells.Add([System.Net.WebUtility]::HtmlDecode($match.Groups[2].Value).ToLowerInvariant())
-                    }
-                }
+            if ($entry.FullName -notlike 'xl/*.xml' -and $entry.FullName -notlike 'xl/*.rels') { continue }
+            $reader = New-Object System.IO.StreamReader($entry.Open())
+            try { $files[$entry.FullName] = $reader.ReadToEnd() } finally { $reader.Dispose() }
+        }
+        $decode = { param($s) [System.Net.WebUtility]::HtmlDecode($s) }
+
+        # Step 1: the shared texts most cells point at, by number.
+        $shared = New-Object System.Collections.Generic.List[string]
+        if ($files.ContainsKey('xl/sharedStrings.xml')) {
+            foreach ($si in [regex]::Matches($files['xl/sharedStrings.xml'], '<si>(.*?)</si>', 'Singleline')) {
+                $shared.Add((& $decode ((@([regex]::Matches($si.Groups[1].Value, '<t(?:\s[^>]*)?>([^<]*)</t>') | ForEach-Object { $_.Groups[1].Value })) -join '')))
             }
         }
-        return [pscustomobject]@{ Sheets = @($sheets); Cells = $cells }
+
+        # Step 2: which file holds which sheet.
+        $targets = @{}
+        if ($files.ContainsKey('xl/_rels/workbook.xml.rels')) {
+            foreach ($rel in [regex]::Matches($files['xl/_rels/workbook.xml.rels'], '<Relationship\b[^>]*>')) {
+                $id = [regex]::Match($rel.Value, '\bId="([^"]+)"').Groups[1].Value
+                $target = [regex]::Match($rel.Value, '\bTarget="([^"]+)"').Groups[1].Value
+                $targets[$id] = if ($target.StartsWith('/')) { $target.TrimStart('/') } else { 'xl/' + $target }
+            }
+        }
+
+        # Step 3: per sheet, the text of each cell in rows 1 to 8.
+        $sheets = New-Object System.Collections.Generic.List[object]
+        foreach ($sheet in [regex]::Matches($files['xl/workbook.xml'], '<sheet\b[^>]*>')) {
+            $name = & $decode ([regex]::Match($sheet.Value, '\bname="([^"]*)"').Groups[1].Value)
+            $relId = [regex]::Match($sheet.Value, '\br:id="([^"]+)"').Groups[1].Value
+            $rows = New-Object System.Collections.Generic.List[object]
+            $xml = if ($targets.ContainsKey($relId)) { $files[$targets[$relId]] } else { $null }
+            if ($xml) {
+                $rowNumber = 0
+                foreach ($row in [regex]::Matches($xml, '<row\b([^>]*?)(?:/>|>(.*?)</row>)', 'Singleline')) {
+                    $numbered = [regex]::Match($row.Groups[1].Value, '\br="(\d+)"')
+                    $rowNumber = if ($numbered.Success) { [int]$numbered.Groups[1].Value } else { $rowNumber + 1 }
+                    if ($rowNumber -gt 8) { break }
+                    $texts = New-Object System.Collections.Generic.List[string]
+                    foreach ($cell in [regex]::Matches($row.Groups[2].Value, '<c\b([^>]*?)(?:/>|>(.*?)</c>)', 'Singleline')) {
+                        $type = [regex]::Match($cell.Groups[1].Value, '\bt="([^"]+)"').Groups[1].Value
+                        $body = $cell.Groups[2].Value
+                        $text = if ($type -eq 's') {
+                            $index = [regex]::Match($body, '<v>(\d+)</v>')
+                            if ($index.Success -and [int]$index.Groups[1].Value -lt $shared.Count) { $shared[[int]$index.Groups[1].Value] } else { '' }
+                        } elseif ($type -eq 'inlineStr') {
+                            & $decode ((@([regex]::Matches($body, '<t(?:\s[^>]*)?>([^<]*)</t>') | ForEach-Object { $_.Groups[1].Value })) -join '')
+                        } else {
+                            & $decode ([regex]::Match($body, '<v>([^<]*)</v>').Groups[1].Value)
+                        }
+                        if ($text) { $texts.Add($text.ToLowerInvariant()) }
+                    }
+                    $rows.Add(@($texts))
+                }
+            }
+            $sheets.Add(@{ Name = $name; HeaderRows = $rows })
+        }
+        return $sheets
     } finally { $zip.Dispose() }
+}
+
+# True when the sheet has a header row naming a source and a target column,
+# in one row or across two rows (a merged group header above the field names).
+function Test-SheetHasHeaders($sheet) {
+    # Indexed directly: wrapping this list of arrays in @() fails in PowerShell.
+    $rows = $sheet.HeaderRows
+    for ($i = 0; $i -lt $rows.Count; $i++) {
+        $cells = @($rows[$i])
+        if ((Test-HeaderWord $cells $SourceHeaderWords $false) -and (Test-HeaderWord $cells $TargetHeaderWords $true)) { return $true }
+        if ($i + 1 -lt $rows.Count) {
+            $pair = $cells + @($rows[$i + 1])
+            if ((Test-HeaderWord $pair $SourceHeaderWords $false) -and (Test-HeaderWord $pair $TargetHeaderWords $true)) { return $true }
+        }
+    }
+    return $false
 }
 
 # Mirrors the parser's sheet-name rules (see the word lists at the top).
@@ -752,17 +811,19 @@ foreach ($dir in $entityDirs) {
                 } elseif ($ext -ne '.xlsx') {
                     Add-Result 'FIX' $label "$($entry.path) is not .xlsx, so the tool skips it (with a warning)." 'Save it as .xlsx (Excel workbook).'
                 } elseif (-not $item.Shared) {
-                    try { $info = Get-XlsxInfo $full } catch { Add-Result 'FIX' $label "$($entry.path) could not be opened as an Excel workbook." 'Re-save it from Excel as .xlsx.'; break }
-                    $usable = @($info.Sheets | Where-Object { -not (Test-SkipSheet $_) })
+                    try { $sheets = @(Get-XlsxInfo $full) } catch { Add-Result 'FIX' $label "$($entry.path) could not be opened as an Excel workbook." 'Re-save it from Excel as .xlsx.'; break }
+                    $sheetNames = @($sheets | ForEach-Object { $_.Name })
+                    $usable = @($sheets | Where-Object { -not (Test-SkipSheet $_.Name) })
                     if ($usable.Count -eq 0) {
-                        Add-Result 'FIX' $label "Every sheet in $($entry.path) has a name containing a word like old, legacy, history or archive, so the parser skips them all (names: $($info.Sheets -join ', '))." 'Rename the current mapping sheet (e.g. "Mapping").'
+                        Add-Result 'FIX' $label "Every sheet in $($entry.path) has a name containing a word like old, legacy, history or archive, so the parser skips them all (names: $($sheetNames -join ', '))." 'Rename the current mapping sheet (e.g. "Mapping").'
                     } else {
-                        $hasSource = Test-HeaderWord $info.Cells $SourceHeaderWords $false
-                        $hasTarget = Test-HeaderWord $info.Cells $TargetHeaderWords $true
-                        if (-not $hasSource -or -not $hasTarget) {
-                            Add-Result 'FIX' $label "$($entry.path) has no recognisable source and target column headers, so it probably yields no mapping rules." 'Within the first 8 rows, use headers such as "Source field" and "Target field".'
+                        # Only sheets the parser reads count, and only their first 8 rows.
+                        $withHeaders = @($usable | Where-Object { Test-SheetHasHeaders $_ })
+                        if ($withHeaders.Count -eq 0) {
+                            Add-Result 'FIX' $label "$($entry.path) has no recognisable source and target column headers in the first 8 rows of a sheet the parser reads, so it probably yields no mapping rules." 'Within the first 8 rows, use headers such as "Source field" and "Target field".'
                         } else { $mappingFilesWithRules++ }
-                        $skipped = @($info.Sheets | Where-Object { $usable -notcontains $_ })
+                        $usableNames = @($usable | ForEach-Object { $_.Name })
+                        $skipped = @($sheetNames | Where-Object { $usableNames -notcontains $_ })
                         if ($skipped.Count -gt 0) { Add-Result 'IMPROVE' $label "These sheets are skipped because of their names: $($skipped -join ', '). Check none of them is the current mapping." 'Rename a sheet if it holds current rules.' }
                     }
                     if ($entry.purpose -eq 'archived') { Add-Result 'FIX' $label "$($entry.path) is marked archived but is still parsed as a current mapping." 'Remove old mappings from the bundle instead of marking them archived.' }

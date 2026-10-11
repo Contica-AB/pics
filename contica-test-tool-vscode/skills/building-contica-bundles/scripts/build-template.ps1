@@ -24,7 +24,9 @@ CHANGING THE BUNDLE
   manifests by hand. What the Contica Test Tool itself adds to a manifest
   (the Azure resource it tests against, an example added with Add Example,
   the format) is kept, as are entries for files that still exist in the
-  bundle.
+  bundle. A file taken out of the CONFIG is removed from the manifest, and
+  the copy this script made earlier is deleted from the bundle (the list of
+  copied files is kept in the integration manifest's sourceProvenance).
 
 Re-run any time the sources change. Works in Windows PowerShell 5.1 and
 PowerShell 7. Sign-in is always the person's own (Git Credential Manager,
@@ -158,6 +160,14 @@ function Test-Config {
             throw "$($target): the mappings list only reads .xlsx spreadsheets. Put mapping code (.cs, .xslt, .liquid) under Category 'code' with Purpose 'transformation'."
         }
         $place = if ($item.Path) { $item.Path } else { $item.To }
+        if (-not $place) { throw "An entry in Files, Folders or KeptFiles has no To or Path." }
+        # The script writes only inside the integration folder: a rooted path
+        # or one that climbs out with '..' could overwrite a file elsewhere.
+        $rootFull = [System.IO.Path]::GetFullPath($BundleRoot).TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar
+        $placeFull = [System.IO.Path]::GetFullPath((Join-Path $BundleRoot $place))
+        if ([System.IO.Path]::IsPathRooted($place) -or -not $placeFull.StartsWith($rootFull, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "$($place): To and Path must be a path inside the integration folder ($BundleRoot), like 'INT0000.i001/code/my-wf/workflow.json'."
+        }
         if ($place -match "^$integrationId\.([io]\d{3}T?)/" -and $entityIds -cnotcontains $Matches[1]) {
             throw "$($place) belongs to entity $($Matches[1]), which is not listed under `$Entities."
         }
@@ -217,8 +227,9 @@ function Copy-IntoBundle([string]$from, [string]$to) {
     $text = Read-TextWithBom $from
     if ($null -ne $text) {
         # UTF-16 in, UTF-8 out. An XML declaration that still says utf-16
-        # would contradict the new bytes, so it is corrected too.
-        $text = $text -replace '(<\?xml[^>]*encoding=")utf-16(")', '$1utf-8$2'
+        # would contradict the new bytes, so it is corrected too, however it
+        # is written (UTF-16, utf-16le, single or double quotes).
+        $text = [regex]::Replace($text, '(<\?xml[^>]*?encoding\s*=\s*)(["''])utf-16(?:le|be)?\2', '${1}${2}utf-8${2}', 'IgnoreCase')
     }
     Write-IntoBundle $from $text $to
 }
@@ -298,7 +309,7 @@ function Add-KeptFiles {
             $notes.Add("$($kept.Path) is listed under KeptFiles but is not in the bundle, so it is left out of the manifest.")
             continue
         }
-        $declared.Add(@{ To = $kept.Path; Category = $kept.Category; Purpose = $kept.Purpose })
+        $declared.Add(@{ To = $kept.Path; Category = $kept.Category; Purpose = $kept.Purpose; Kept = $true })
     }
 }
 
@@ -394,7 +405,7 @@ function Read-ExistingManifest([string]$path) {
 # Builds one file list (documentation, examples, ...) for a manifest: the
 # CONFIG's entries first, then entries the manifest already had for files that
 # still exist (for example an example added with the tool's Add Example).
-function Get-FileSection($fromConfig, $existingSection, [string]$manifestDir) {
+function Get-FileSection($fromConfig, $existingSection, [string]$manifestDir, [string]$relPrefix) {
     $section = [ordered]@{}
     foreach ($category in $AllowedPurposes.Keys) {
         $list = New-Object System.Collections.Generic.List[object]
@@ -405,6 +416,8 @@ function Get-FileSection($fromConfig, $existingSection, [string]$manifestDir) {
         if ($existingSection -and $existingSection.Contains($category)) {
             foreach ($old in @($existingSection[$category])) {
                 if (-not $old -or -not $old.path -or $paths.Contains($old.path)) { continue }
+                # Copied by an earlier run of this script but no longer in CONFIG.
+                if ($staleManaged.Contains($relPrefix + $old.path)) { continue }
                 if (Test-Path -LiteralPath (Join-Path $manifestDir $old.path) -PathType Leaf) {
                     [void]$paths.Add($old.path)
                     $list.Add($old)
@@ -437,14 +450,37 @@ function Save-Manifest([string]$path, $manifest, $existing) {
 $IntegrationFields = @('manifestVersion', 'scope', 'integrationId', 'integrationName', 'jiraEpic', 'fetchedAt', 'fetchedBy', 'sourceProvenance', 'sharedFiles', 'entities')
 $EntityFields = @('manifestVersion', 'scope', 'integrationId', 'entityId', 'entityName', 'direction', 'sourceSystem', 'targetSystem', 'format', 'jiraKey', 'inheritsFrom', 'entityFiles')
 
+# What this run copied (paths inside the integration folder), and what an
+# earlier run copied that this one did not.
+$staleManaged = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+
+function Remove-StaleFiles([string[]]$previous, [string[]]$current) {
+    foreach ($old in $previous) {
+        if (-not $old -or $current -contains $old) { continue }
+        [void]$staleManaged.Add($old)
+        $full = Join-Path $BundleRoot $old
+        if (Test-Path -LiteralPath $full -PathType Leaf) {
+            $changes.Add("(removed, no longer in CONFIG) $old")
+            if (-not $WhatIf) { Remove-Item -LiteralPath $full -Force }
+        }
+    }
+}
+
 function Write-Manifests {
+    $intPath = Join-Path $BundleRoot 'manifest.json'
+    $existing = Read-ExistingManifest $intPath
+    $previous = @()
+    if ($existing.Contains('sourceProvenance') -and $existing['sourceProvenance'] -is [System.Collections.IDictionary] -and $existing['sourceProvenance'].Contains('managedFiles')) {
+        $previous = @($existing['sourceProvenance']['managedFiles'] | ForEach-Object { [string]$_ })
+    }
+    $managed = @($declared | Where-Object { -not $_.Kept } | ForEach-Object { $_.To } | Sort-Object -Unique)
+    $keptPaths = @($declared | Where-Object { $_.Kept } | ForEach-Object { $_.To })
+    Remove-StaleFiles $previous (@($managed) + $keptPaths)
 
     # Integration manifest: every declared file outside an entity folder.
     $sharedItems = foreach ($d in $declared) {
         if ($d.To -notmatch "^$integrationId\.[io]\d{3}T?/") { @{ Path = $d.To; Category = $d.Category; Purpose = $d.Purpose } }
     }
-    $intPath = Join-Path $BundleRoot 'manifest.json'
-    $existing = Read-ExistingManifest $intPath
     $manifest = [ordered]@{
         manifestVersion  = 1
         scope            = 'integration'
@@ -455,9 +491,9 @@ function Write-Manifests {
     elseif ($existing.Contains('jiraEpic')) { $manifest['jiraEpic'] = $existing['jiraEpic'] }
     $manifest['fetchedAt'] = ''
     $manifest['fetchedBy'] = $scriptName
-    $manifest['sourceProvenance'] = [ordered]@{ kind = 'scripted'; rootPath = '' }
+    $manifest['sourceProvenance'] = [ordered]@{ kind = 'scripted'; rootPath = ''; managedFiles = $managed }
     $existingShared = if ($existing.Contains('sharedFiles')) { $existing['sharedFiles'] } else { $null }
-    $manifest['sharedFiles'] = Get-FileSection @($sharedItems) $existingShared $BundleRoot
+    $manifest['sharedFiles'] = Get-FileSection @($sharedItems) $existingShared $BundleRoot ''
     $manifest['entities'] = @($Entities | ForEach-Object { $_.Id })
     foreach ($key in $existing.Keys) { if ($IntegrationFields -notcontains $key) { $manifest[$key] = $existing[$key] } }
     Save-Manifest $intPath $manifest $existing
@@ -491,7 +527,7 @@ function Write-Manifests {
         $manifest['fetchedBy'] = $scriptName
         $manifest['inheritsFrom'] = '../manifest.json'
         $existingFiles = if ($existing.Contains('entityFiles')) { $existing['entityFiles'] } else { $null }
-        $manifest['entityFiles'] = Get-FileSection @($items) $existingFiles $entityDir
+        $manifest['entityFiles'] = Get-FileSection @($items) $existingFiles $entityDir $prefix
         foreach ($key in $existing.Keys) { if ($EntityFields -notcontains $key) { $manifest[$key] = $existing[$key] } }
         Save-Manifest $path $manifest $existing
     }
