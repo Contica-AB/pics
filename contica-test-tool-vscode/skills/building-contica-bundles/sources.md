@@ -190,7 +190,8 @@ use another source.
 
 **Access needed:**
 - Standard: **Logic Apps Standard Reader** on the Logic App (reading run
-  history is a read; listing trigger URLs is not needed here).
+  history is a read; listing trigger URLs is not needed here). This is only
+  for collecting examples: running tests needs more (see `testing.md`).
 - Consumption: **Logic App Operator** (or Reader) on the Logic App.
 - `az login` with the account that has the role.
 

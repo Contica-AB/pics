@@ -232,6 +232,376 @@ function Read-Manifest([string]$path, [string]$where) {
     }
 }
 
+# ----- Testing: how the tool sends test messages and runs them locally --------
+# A port of the tool's own rules (2.0.0): which workflow receives the test
+# messages, through which trigger, and whether Run locally can run it.
+
+function Test-IsObject($value) { return $value -is [System.Management.Automation.PSCustomObject] }
+
+# A property of a JSON object, or $null.
+function Get-Prop($object, [string]$name) {
+    if (Test-IsObject $object) {
+        $prop = $object.PSObject.Properties[$name]
+        if ($prop) { return $prop.Value }
+    }
+    return $null
+}
+
+# Text that is not empty, trimmed; otherwise $null.
+function Get-NonEmpty($value) {
+    if ($value -is [string] -and $value.Trim().Length -gt 0) { return $value.Trim() }
+    return $null
+}
+
+function Get-JsonLower($value) {
+    if ($null -eq $value) { return '""' }
+    return (ConvertTo-Json -InputObject $value -Compress -Depth 30).ToLowerInvariant()
+}
+
+# workflow.json wraps the definition; a bare definition is accepted too.
+function Get-Definition($workflow) {
+    $definition = Get-Prop $workflow 'definition'
+    if (Test-IsObject $definition) { return $definition }
+    return $workflow
+}
+
+# The triggers a workflow declares, and how a test message can reach each.
+function Get-Triggers($workflow) {
+    $result = New-Object System.Collections.Generic.List[object]
+    $triggers = Get-Prop (Get-Definition $workflow) 'triggers'
+    if (-not (Test-IsObject $triggers)) { return $result }
+    foreach ($prop in $triggers.PSObject.Properties) {
+        $raw = $prop.Value
+        if (-not (Test-IsObject $raw)) { continue }
+        $type = "$(Get-NonEmpty (Get-Prop $raw 'type'))".ToLowerInvariant()
+        $kind = "$(Get-NonEmpty (Get-Prop $raw 'kind'))".ToLowerInvariant()
+        $inputs = Get-Prop $raw 'inputs'
+        $params = Get-Prop $inputs 'parameters'
+        $provider = "$(Get-NonEmpty (Get-Prop (Get-Prop $inputs 'serviceProviderConfiguration') 'serviceProviderId'))".ToLowerInvariant()
+        $connection = Get-JsonLower (Get-Prop $inputs 'host')
+        $path = Get-NonEmpty (Get-Prop $inputs 'path')
+        $trigger = @{ Name = $prop.Name; Kind = 'other'; Queue = $null; Topic = $null; Subscription = $null; Container = $null; FromSetting = $false }
+        if ($type -eq 'request' -or $type -eq 'httpwebhook' -or $kind -eq 'http') {
+            $trigger.Kind = 'http'
+        } elseif ($type -eq 'recurrence' -or $type -eq 'slidingwindow') {
+            $trigger.Kind = 'schedule'
+        } elseif ($provider.Contains('servicebus') -or $connection.Contains('servicebus')) {
+            $trigger.Kind = 'serviceBus'
+            $segments = @()
+            if ($path) { $segments = @([regex]::Matches($path, "'([^']+)'") | ForEach-Object { $_.Groups[1].Value }) }
+            $isTopicPath = [bool]($path -and $path -match '/subscriptions/')
+            $trigger.Queue = Get-NonEmpty (Get-Prop $params 'queueName')
+            if (-not $trigger.Queue -and -not $isTopicPath -and $segments.Count -gt 0) { $trigger.Queue = $segments[0] }
+            $trigger.Topic = Get-NonEmpty (Get-Prop $params 'topicName')
+            if (-not $trigger.Topic -and $isTopicPath -and $segments.Count -gt 0) { $trigger.Topic = $segments[0] }
+            $trigger.Subscription = Get-NonEmpty (Get-Prop $params 'subscriptionName')
+            if (-not $trigger.Subscription -and $isTopicPath -and $segments.Count -gt 1) { $trigger.Subscription = $segments[1] }
+            foreach ($value in @($trigger.Queue, $trigger.Topic, $trigger.Subscription)) { if ($value -and $value.StartsWith('@')) { $trigger.FromSetting = $true } }
+        } elseif ($provider.Contains('blob') -or $connection.Contains('azureblob')) {
+            $trigger.Kind = 'blob'
+            $container = Get-NonEmpty (Get-Prop $params 'containerName')
+            if (-not $container) {
+                $blobPath = Get-NonEmpty (Get-Prop $params 'path')
+                if ($blobPath) { $container = $blobPath.Split('/')[0] }
+            }
+            $trigger.Container = $container
+            if (-not $container -or $container.StartsWith('@')) { $trigger.FromSetting = $true }
+        }
+        $result.Add($trigger)
+    }
+    return $result
+}
+
+# Every action, including actions nested inside others (for what it sends on).
+function Get-AllActions($workflow) {
+    $found = New-Object System.Collections.Generic.List[object]
+    $toVisit = New-Object System.Collections.Generic.Queue[object]
+    $toVisit.Enqueue((Get-Prop (Get-Definition $workflow) 'actions'))
+    while ($toVisit.Count -gt 0) {
+        $actions = $toVisit.Dequeue()
+        if (-not (Test-IsObject $actions)) { continue }
+        foreach ($prop in $actions.PSObject.Properties) {
+            $action = $prop.Value
+            if (-not (Test-IsObject $action)) { continue }
+            $found.Add($action)
+            $toVisit.Enqueue((Get-Prop $action 'actions'))
+            $toVisit.Enqueue((Get-Prop (Get-Prop $action 'else') 'actions'))
+            $cases = Get-Prop $action 'cases'
+            if (Test-IsObject $cases) { foreach ($case in $cases.PSObject.Properties) { $toVisit.Enqueue((Get-Prop $case.Value 'actions')) } }
+            $toVisit.Enqueue((Get-Prop (Get-Prop $action 'default') 'actions'))
+        }
+    }
+    return $found
+}
+
+# A value built from a setting or parameter, wholly or in part.
+function Test-HasExpression([string]$value) { return $value.StartsWith('@') -or $value.Contains('@{') }
+
+# What a workflow sends onward: another workflow, a URL, a queue or topic, a container.
+function Get-OutgoingCalls($workflow) {
+    $calls = New-Object System.Collections.Generic.List[object]
+    foreach ($action in (Get-AllActions $workflow)) {
+        $type = "$(Get-NonEmpty (Get-Prop $action 'type'))".ToLowerInvariant()
+        $inputs = Get-Prop $action 'inputs'
+        $params = Get-Prop $inputs 'parameters'
+        $config = Get-Prop $inputs 'serviceProviderConfiguration'
+        $provider = "$(Get-NonEmpty (Get-Prop $config 'serviceProviderId'))".ToLowerInvariant()
+        $operation = "$(Get-NonEmpty (Get-Prop $config 'operationId'))".ToLowerInvariant()
+        $connection = Get-JsonLower (Get-Prop $inputs 'host')
+        $method = "$(Get-NonEmpty (Get-Prop $inputs 'method'))".ToLowerInvariant()
+        if ($type -eq 'workflow') {
+            $id = Get-NonEmpty (Get-Prop (Get-Prop (Get-Prop $inputs 'host') 'workflow') 'id')
+            if ($id -and -not (Test-HasExpression $id)) {
+                $parts = @($id.Split('/') | Where-Object { $_.Length -gt 0 })
+                if ($parts.Count -gt 0) { $calls.Add(@{ Kind = 'workflow'; Name = $parts[$parts.Count - 1] }) }
+            }
+        } elseif ($type -eq 'http') {
+            $uri = Get-NonEmpty (Get-Prop $inputs 'uri')
+            if ($uri -and -not $uri.StartsWith('@')) {
+                $hostPart = ''
+                $m = [regex]::Match($uri, '^[a-z][a-z0-9+.-]*://([^/]*)', 'IgnoreCase')
+                if ($m.Success) { $hostPart = $m.Groups[1].Value }
+                $parsed = $null
+                if (-not $hostPart.Contains('@') -and -not $hostPart.Contains('{') -and [Uri]::TryCreate($uri, [UriKind]::Absolute, [ref]$parsed)) {
+                    $calls.Add(@{ Kind = 'http'; Host = $parsed.Host.ToLowerInvariant(); Path = $parsed.AbsolutePath })
+                }
+            }
+        } elseif ($type -eq 'serviceprovider' -and $provider.Contains('servicebus') -and $operation.StartsWith('sendmessage')) {
+            $entity = Get-NonEmpty (Get-Prop $params 'entityName')
+            if (-not $entity) { $entity = Get-NonEmpty (Get-Prop $params 'queueName') }
+            if (-not $entity) { $entity = Get-NonEmpty (Get-Prop $params 'topicName') }
+            if ($entity -and -not (Test-HasExpression $entity)) { $calls.Add(@{ Kind = 'serviceBus'; Entity = $entity }) }
+        } elseif ($type -eq 'serviceprovider' -and $provider.Contains('blob') -and ($operation -eq 'uploadblob' -or $operation.StartsWith('createblob'))) {
+            $container = Get-NonEmpty (Get-Prop $params 'containerName')
+            if (-not $container) {
+                $blobName = Get-NonEmpty (Get-Prop $params 'blobName')
+                if ($blobName -and $blobName.Contains('/')) { $container = $blobName.Split('/')[0] }
+            }
+            if ($container -and -not (Test-HasExpression $container)) { $calls.Add(@{ Kind = 'blob'; Container = $container }) }
+        } elseif ($type -eq 'apiconnection') {
+            $path = Get-NonEmpty (Get-Prop $inputs 'path')
+            if ($connection.Contains('servicebus') -and $method -eq 'post' -and $path -and $path -match '/messages(/batch)?$') {
+                $m = [regex]::Match($path, "encodeURIComponent\(\s*'([^']+)'\s*\)", 'IgnoreCase')
+                if ($m.Success) { $calls.Add(@{ Kind = 'serviceBus'; Entity = $m.Groups[1].Value }) }
+            } elseif ($connection.Contains('azureblob') -and ($method -eq 'post' -or $method -eq 'put')) {
+                $folderPath = Get-NonEmpty (Get-Prop (Get-Prop $inputs 'queries') 'folderPath')
+                if ($folderPath -and -not (Test-HasExpression $folderPath)) {
+                    $first = @($folderPath.Split('/') | Where-Object { $_.Length -gt 0 })
+                    if ($first.Count -gt 0) { $calls.Add(@{ Kind = 'blob'; Container = $first[0] }) }
+                }
+            }
+        }
+    }
+    return $calls
+}
+
+function Test-SameName($a, $b) { return "$a".Trim().ToLowerInvariant() -eq "$b".Trim().ToLowerInvariant() }
+
+# True when workflow $from passes messages on to workflow $to.
+function Test-HandsOnTo($from, $to) {
+    if (Test-SameName $from.Name $to.Name) { return $false }
+    $triggerPathStart = "/api/$($to.Name.ToLowerInvariant())/triggers/"
+    foreach ($call in $from.Outgoing) {
+        switch ($call.Kind) {
+            'workflow' { if (Test-SameName $call.Name $to.Name) { return $true } }
+            'http' { if ($call.Path.ToLowerInvariant().StartsWith($triggerPathStart)) { return $true } }
+            'serviceBus' { foreach ($t in $to.Triggers) { if ($t.Kind -eq 'serviceBus' -and ((Test-SameName $t.Queue $call.Entity) -or (Test-SameName $t.Topic $call.Entity))) { return $true } } }
+            'blob' { foreach ($t in $to.Triggers) { if ($t.Kind -eq 'blob' -and (Test-SameName $t.Container $call.Container)) { return $true } } }
+        }
+    }
+    return $false
+}
+
+# The named workflow and everything it hands on to, at any depth.
+function Get-Reachable($workflows, [string]$name) {
+    $result = New-Object System.Collections.Generic.List[object]
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]'
+    $toVisit = New-Object System.Collections.Generic.Queue[object]
+    foreach ($w in $workflows) { if (Test-SameName $w.Name $name) { $toVisit.Enqueue($w); break } }
+    while ($toVisit.Count -gt 0) {
+        $current = $toVisit.Dequeue()
+        if (-not $seen.Add($current.Name.ToLowerInvariant())) { continue }
+        $result.Add($current)
+        foreach ($child in $workflows) { if (Test-HandsOnTo $current $child) { $toVisit.Enqueue($child) } }
+    }
+    return $result
+}
+
+function Test-CanReceive($workflow) {
+    foreach ($t in $workflow.Triggers) { if (@('http', 'serviceBus', 'blob') -contains $t.Kind) { return $true } }
+    return $false
+}
+
+# Where test messages go: the same three steps as the tool's
+# receivingWorkflowNames (workflowHandoffs.ts).
+function Get-ReceivingWorkflows($workflows) {
+    $tops = @($workflows | Where-Object { $w = $_; -not @($workflows | Where-Object { Test-HandsOnTo $_ $w }).Count })
+    $reachedFromTops = New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach ($top in $tops) { foreach ($r in (Get-Reachable $workflows $top.Name)) { [void]$reachedFromTops.Add($r.Name.ToLowerInvariant()) } }
+    $loopMembers = @()
+    foreach ($w in $workflows) {
+        if ($reachedFromTops.Contains($w.Name.ToLowerInvariant())) { continue }
+        $reachedFromIt = @(Get-Reachable $workflows $w.Name)
+        $ownLoop = $true
+        foreach ($other in $workflows) {
+            if (Test-SameName $other.Name $w.Name) { continue }
+            $otherReachesIt = @(Get-Reachable $workflows $other.Name | Where-Object { Test-SameName $_.Name $w.Name }).Count -gt 0
+            $itReachesOther = @($reachedFromIt | Where-Object { Test-SameName $_.Name $other.Name }).Count -gt 0
+            if ($otherReachesIt -and -not $itReachesOther) { $ownLoop = $false }
+        }
+        if ($ownLoop) { $loopMembers += $w }
+    }
+    $receiving = New-Object 'System.Collections.Generic.HashSet[string]'
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]'
+    $level = @($tops) + @($loopMembers)
+    while ($level.Count -gt 0) {
+        $next = @()
+        foreach ($w in $level) {
+            if (-not $seen.Add($w.Name.ToLowerInvariant())) { continue }
+            if (Test-CanReceive $w) { [void]$receiving.Add($w.Name.ToLowerInvariant()) }
+            else { $next += @($workflows | Where-Object { Test-HandsOnTo $w $_ }) }
+        }
+        $level = $next
+    }
+    return @($workflows | Where-Object { $receiving.Contains($_.Name.ToLowerInvariant()) })
+}
+
+# The steps of a workflow as the tool's workflow reader walks them: inside
+# conditions, switches, loops and scopes.
+function Get-GraphSteps($actions) {
+    $steps = New-Object System.Collections.Generic.List[object]
+    if (-not (Test-IsObject $actions)) { return $steps }
+    foreach ($prop in $actions.PSObject.Properties) {
+        $raw = $prop.Value
+        if (-not (Test-IsObject $raw)) { continue }
+        $type = "$(Get-Prop $raw 'type')"
+        $steps.Add(@{ Name = $prop.Name; Type = $type; Raw = $raw })
+        $t = $type.ToLowerInvariant()
+        $children = @()
+        if ($t -eq 'if') { $children = @((Get-Prop $raw 'actions'), (Get-Prop (Get-Prop $raw 'else') 'actions')) }
+        elseif ($t -eq 'switch') {
+            $cases = Get-Prop $raw 'cases'
+            if (Test-IsObject $cases) { foreach ($c in $cases.PSObject.Properties) { $children += , (Get-Prop $c.Value 'actions') } }
+            $children += , (Get-Prop (Get-Prop $raw 'default') 'actions')
+        } elseif (@('foreach', 'until', 'scope') -contains $t) { $children = @((Get-Prop $raw 'actions')) }
+        foreach ($child in $children) { foreach ($s in (Get-GraphSteps $child)) { $steps.Add($s) } }
+    }
+    return $steps
+}
+
+$NotRunLocally = @{
+    'agent' = 'an AI agent step'; 'integrationaccountartifactlookup' = 'an integration account lookup'
+    'x12encode' = 'an X12 encode step'; 'x12decode' = 'an X12 decode step'; 'x12batchencode' = 'an X12 batch step'
+    'edifactencode' = 'an EDIFACT encode step'; 'edifactdecode' = 'an EDIFACT decode step'; 'edifactbatchencode' = 'an EDIFACT batch step'
+    'as2encode' = 'an AS2 encode step'; 'as2decode' = 'an AS2 decode step'
+}
+$TriggerWords = @{ 'blob' = 'a Blob Storage trigger'; 'schedule' = 'a schedule' }
+$ProductionWord = '(^|[^a-z0-9])(prod|prd|production)([^a-z0-9]|$)'
+
+# What testing this entity looks like: Run in Azure and Run locally, worked
+# out from its code files the way the tool does. Returns plain lines.
+function Get-TestingReport($codeFiles, [string]$where) {
+    $lines = New-Object System.Collections.Generic.List[string]
+    $workflows = New-Object System.Collections.Generic.List[object]
+    $workflowText = @{}
+    foreach ($file in $codeFiles) {
+        $parts = @($file.Path -split '[\\/]' | Where-Object { $_.Length -gt 0 })
+        $isWorkflow = $file.Purpose -eq 'workflow-definition' -or $file.Path -match 'workflow\.json$'
+        $index = -1
+        for ($i = 0; $i -lt $parts.Count; $i++) { if ($parts[$i] -match '^workflow\.json$') { $index = $i; break } }
+        if (-not $isWorkflow -or $index -lt 1) { continue }
+        $name = $parts[$index - 1]
+        $text = Read-Text $file.Full
+        $json = $null
+        try { $json = $text | ConvertFrom-Json } catch { }
+        $triggers = @(); $outgoing = @()
+        if ($json) { $triggers = @(Get-Triggers $json); $outgoing = @(Get-OutgoingCalls $json) }
+        $workflows.Add(@{ Name = $name; Triggers = $triggers; Outgoing = $outgoing; Json = $json })
+    }
+    if ($workflows.Count -eq 0) {
+        $lines.Add('Run in Azure: no workflow.json, so the tool cannot tell which workflow to send test messages to.')
+        $lines.Add("Run locally: not available. This bundle has no workflow.json, so there's nothing to run on your computer.")
+        return $lines
+    }
+
+    # Run in Azure
+    $receiving = @(Get-ReceivingWorkflows $workflows)
+    if ($receiving.Count -eq 0) {
+        $lines.Add('Run in Azure: no workflow in this bundle can receive a test message (HTTP, Service Bus or Blob trigger).')
+        Add-Result 'FIX' $where 'No workflow in this bundle can receive a test message, so the Test step has nothing to send to.' 'Include the workflow that receives the messages from outside (its HTTP, Service Bus or Blob trigger).'
+    }
+    foreach ($w in $receiving) {
+        foreach ($t in $w.Triggers) {
+            switch ($t.Kind) {
+                'http' { $lines.Add("Run in Azure: workflow $($w.Name), HTTP trigger '$($t.Name)'. The tool gets the trigger's address from Azure.") }
+                'serviceBus' {
+                    if ($t.FromSetting) {
+                        $lines.Add("Run in Azure: refused. Workflow $($w.Name) reads its Service Bus queue or topic from a setting (see FIX above).")
+                        Add-Result 'FIX' $where "Workflow `"$($w.Name)`" reads its Service Bus queue or topic from a setting, so Run in Azure refuses to send to it: the bundle cannot say which one is right." 'Use Run locally for this entity. To test it in Azure, the developers must write the queue or topic name into the workflow trigger; then rebuild the bundle.'
+                    } elseif ($t.Topic) { $lines.Add("Run in Azure: workflow $($w.Name), Service Bus topic '$($t.Topic)'$(if ($t.Subscription) { ", subscription '$($t.Subscription)'" }).") }
+                    else { $lines.Add("Run in Azure: workflow $($w.Name), Service Bus queue '$($t.Queue)'.") }
+                }
+                'blob' {
+                    if ($t.FromSetting) {
+                        $lines.Add("Run in Azure: refused. Workflow $($w.Name) reads its Blob container from a setting (see FIX above).")
+                        Add-Result 'FIX' $where "Workflow `"$($w.Name)`" reads its Blob container from a setting, so Run in Azure refuses to send to it: the bundle cannot say which one is right." 'To test it in Azure, the developers must write the container name into the workflow trigger; then rebuild the bundle. (Run locally does not support Blob triggers.)'
+                    } else { $lines.Add("Run in Azure: workflow $($w.Name), Blob container '$($t.Container)'.") }
+                }
+            }
+        }
+        # Production-looking addresses the workflow sends on to, at any depth.
+        $hosts = New-Object 'System.Collections.Generic.HashSet[string]'
+        foreach ($reached in (Get-Reachable $workflows $w.Name)) {
+            foreach ($call in $reached.Outgoing) { if ($call.Kind -eq 'http' -and $call.Host -match $ProductionWord) { [void]$hosts.Add($call.Host) } }
+        }
+        if ($hosts.Count -gt 0) {
+            Add-Result 'IMPROVE' $where "Workflow $($w.Name) sends on to $(@($hosts) -join ', '), which looks like production. The tool will warn and ask the tester to type the Logic App's name before sending." 'Check with the developers that the test Logic App calls a test system there.'
+        }
+    }
+
+    # Run locally
+    $reason = $null
+    $local = $null
+    if ($receiving.Count -ne 1) {
+        if ($receiving.Count -eq 0) { $reason = 'No workflow in this bundle can receive a test message, so there is nothing to run.' }
+        else { $reason = "This bundle has more than one workflow that receives messages ($(($receiving | ForEach-Object { $_.Name }) -join ', ')). Running locally supports one for now." }
+    } else {
+        $local = $receiving[0]
+        if ($null -eq $local.Json) { $reason = "The workflow $($local.Name) could not be read." }
+        elseif ($local.Triggers.Count -ne 1) { $reason = "$($local.Name) has $($local.Triggers.Count) triggers. Running locally supports a workflow with one." }
+        elseif (@('http', 'serviceBus') -notcontains $local.Triggers[0].Kind) {
+            $words = if ($TriggerWords.ContainsKey($local.Triggers[0].Kind)) { $TriggerWords[$local.Triggers[0].Kind] } else { 'a trigger of another kind' }
+            $reason = "$($local.Name) starts on $words. Running locally supports HTTP and Service Bus triggers for now. Use Run in Azure for this one."
+        }
+    }
+    if (-not $reason) {
+        $definition = Get-Definition $local.Json
+        $steps = @(Get-GraphSteps (Get-Prop $definition 'actions'))
+        $mapsInBundle = @($codeFiles | Where-Object { $_.Purpose -eq 'transformation' } | ForEach-Object { [System.IO.Path]::GetFileName($_.Path).ToLowerInvariant() })
+        $missingMaps = @(); $accountMaps = @()
+        foreach ($step in $steps) {
+            $t = $step.Type.ToLowerInvariant()
+            if ($NotRunLocally.ContainsKey($t)) { $reason = "$($local.Name) has $($NotRunLocally[$t]) ($($step.Name)), which can't run on your computer. Use Run in Azure for this one."; break }
+            if ($t -eq 'xslt' -or $t -eq 'liquid') {
+                $map = Get-Prop (Get-Prop $step.Raw 'inputs') 'map'
+                $mapName = "$(Get-Prop $map 'name')"; $mapSource = "$(Get-Prop $map 'source')"
+                if ($mapSource.ToLowerInvariant() -eq 'integrationaccount') { $accountMaps += "$mapName ($($step.Name))" }
+                elseif (-not $mapName -or $mapsInBundle -notcontains $mapName.ToLowerInvariant()) { $missingMaps += "$(if ($mapName) { $mapName } else { '(unnamed)' }) ($($step.Name))" }
+            }
+        }
+        if (-not $reason) {
+            $lines.Add("Run locally: available. Workflow $($local.Name), $(if ($local.Triggers[0].Kind -eq 'http') { 'HTTP' } else { 'Service Bus' }) trigger. Calls to other systems are faked as successful.")
+            foreach ($map in $missingMaps) {
+                $lines.Add("Run locally: the map $map is not in the bundle, so that step cannot run (see FIX above).")
+                Add-Result 'FIX' $where "The map $map is not in the bundle, so Run locally cannot run that step." 'Add the map file under code with purpose transformation, using exactly the file name the workflow uses.'
+            }
+            foreach ($map in $accountMaps) { $lines.Add("Run locally: the map $map is in an integration account, so that step is checked in Azure only.") }
+        }
+    }
+    if ($reason) { $lines.Add("Run locally: not available. $reason") }
+    return $lines
+}
+
 # ----- Integration level -----------------------------------------------------
 if (-not (Test-Path $BundleRoot -PathType Container)) { throw "Bundle folder not found: $BundleRoot" }
 $BundleRoot = (Resolve-Path $BundleRoot).Path
@@ -269,6 +639,7 @@ if ($entityDirs.Count -eq 0) {
 }
 
 $readinessByEntity = [ordered]@{}
+$testingByEntity = [ordered]@{}
 
 # Lists every file entry of a manifest section as (category, entry, base folder).
 function Get-Entries($section, [string]$baseDir) {
@@ -317,6 +688,7 @@ foreach ($dir in $entityDirs) {
 
     $examples = @(); $mappingFilesWithRules = 0; $schemaCount = 0; $hasWorkflow = $false; $docDeclared = $false
     $codeCount = 0; $standardsCount = 0; $hasMapCode = $false
+    $codeFiles = @()
     # Bytes of the entity's own main documentation and of the shared one;
     # the tool joins the two, and its size limits apply to the joined text.
     $entityDocBytes = -1; $sharedDocBytes = 0
@@ -409,6 +781,7 @@ foreach ($dir in $entityDirs) {
             }
             'code' {
                 $codeCount++
+                $codeFiles += [pscustomobject]@{ Path = [string]$entry.path; Purpose = [string]$entry.purpose; Full = $full }
                 if ($CodeExtensions -notcontains $ext) { Add-Result 'FIX' $label "$($entry.path): $ext files are skipped." 'Include only source files (.json, .cs, .xslt, .liquid ...).' }
                 if ($entry.purpose -eq 'workflow-definition') {
                     $hasWorkflow = $true
@@ -485,6 +858,7 @@ foreach ($dir in $entityDirs) {
     if ($missing.Count -gt 0) { $detail += "; missing $($missing -join ', ')" }
     $detail += "; $mappingFilesWithRules spreadsheet(s) with source and target column headers"
     $readinessByEntity[$where] = "$readiness, $score of 5 ($detail)"
+    $testingByEntity[$where] = @(Get-TestingReport $codeFiles $where)
 
     # Files that sit in the entity folder but are not in the manifest are never read.
     Get-ChildItem -LiteralPath $dir.FullName -Recurse -File | Where-Object { $_.Name -ne 'manifest.json' -and -not $declared.Contains($_.FullName) } | ForEach-Object {
@@ -512,6 +886,10 @@ foreach ($key in $readinessByEntity.Keys) {
     $blocked = @($results | Where-Object { $_.Level -eq 'BLOCKING' -and $_.Where -like "$key*" }).Count -gt 0
     $suffix = if ($blocked) { ' - but BLOCKING above: Analyse cannot run yet' } else { '' }
     Write-Host "Sidebar readiness ${key}: $($readinessByEntity[$key])$suffix"
+}
+foreach ($key in $testingByEntity.Keys) {
+    Write-Host "Testing ${key}:"
+    foreach ($line in $testingByEntity[$key]) { Write-Host "    $line" }
 }
 Write-Host "$($entityDirs.Count) entities checked: $blocking blocking, $fix to fix, $improve to improve."
 if ($blocking -gt 0) { exit 1 }

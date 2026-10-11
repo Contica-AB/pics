@@ -1,6 +1,6 @@
 ---
 name: building-contica-bundles
-description: Use when someone needs to prepare, build, refresh or fix a bundle (an INT#### folder with manifest.json files) for the Contica Test Tool VS Code extension, when they ask where to find an integration's documentation, mappings, schemas, example messages or Logic App code for it, or when the tool reports NO_EXAMPLE_MESSAGE, THIN_COVERAGE, a missing entity or a thin/partial bundle.
+description: Use when someone needs to prepare, build, refresh or fix a bundle (an INT#### folder with manifest.json files) for the Contica Test Tool VS Code extension, when they ask where to find an integration's documentation, mappings, schemas, example messages or Logic App code for it, when they ask what they need to test a Logic App with the tool (Azure roles, Run in Azure, Run locally, test subscriptions), or when the tool reports NO_EXAMPLE_MESSAGE, THIN_COVERAGE, a missing entity, a thin/partial bundle, or refuses to send a test.
 ---
 
 # Building Contica bundles
@@ -27,6 +27,9 @@ Files in this skill (read them when the step says so):
 - `sources.md`: per source (DevOps repo, DevOps wiki, Confluence,
   SharePoint, run history, Service Bus) the fetch route and the **access
   needed**.
+- `testing.md`: everything testing needs beyond the bundle: Azure roles,
+  sign-in, environments, safety checks, Run in Azure, Run locally, results,
+  and why a test cannot run.
 - `scripts/build-template.ps1`: the build script you copy and fill in.
 - `scripts/check-bundle.ps1`: the checker. Read-only, no install needed.
 
@@ -59,6 +62,12 @@ the question tool when available). "I don't know" is a valid answer:
 | Mapping spreadsheets (.xlsx) | SharePoint/Teams library, the repo, local folder |
 | Example messages | Logic App run history (test), Service Bus (test), the test team's files |
 | Error-handling standard | Team wiki or Confluence page, another bundle |
+
+Also ask where they will test: the Azure test subscription and Logic App
+the workflows run in, and whether they want to run tests on their own
+computer too. You need this for the testing part of the report (step 6). If
+it is a Consumption Logic App, say now that the tool can analyse it and
+generate tests, but cannot send them (`testing.md`).
 
 For "I don't know": start from the code repo, which often holds docs,
 schemas and sometimes mappings. If Atlassian, SharePoint or Azure DevOps
@@ -197,6 +206,13 @@ plainly. Ask about the rest. Then report to the person in their words:
   that is BLOCKING);
 - what is missing and which tests that costs them ("no workflow.json, so no
   Run locally and nothing to find in Azure");
+- testing, per entity, from the checker's "Testing" lines: where Run in
+  Azure will send (workflow and trigger) or why it will refuse, and whether
+  Run locally works or why not. Then what they need before the first test,
+  from `testing.md`: the Azure roles for their trigger kinds, the Test
+  subscriptions row, the .NET 10 SDK for Run locally, and the order Analyse,
+  Approve, Generate, Test. Answer testing questions from `testing.md`;
+  do not guess;
 - the disagreements between sources you noted in step 4;
 - how to refresh later: run `build-INT####.ps1`, then **Sync** in the
   tool's sidebar to share it with the team. Do not commit for them.

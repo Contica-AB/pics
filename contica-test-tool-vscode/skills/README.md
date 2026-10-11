@@ -13,7 +13,9 @@ everything, copies it into the right folders and writes all the
 
 Along the way it tells you which access you need for each source, asks you
 which example message is the normal one, and checks the finished bundle the
-same way the Contica Test Tool reads it.
+same way the Contica Test Tool reads it. It also tells you, per entity,
+whether Run in Azure and Run locally will work and what you need before the
+first test: Azure roles, test subscriptions, the .NET SDK.
 
 ## What is in the folder
 
@@ -22,6 +24,7 @@ same way the Contica Test Tool reads it.
 | `building-contica-bundles/SKILL.md` | The steps Claude follows |
 | `building-contica-bundles/reference.md` | How the Contica Test Tool (2.0.0) reads a bundle |
 | `building-contica-bundles/sources.md` | Where material usually lives, and the access each source needs |
+| `building-contica-bundles/testing.md` | What testing needs: Azure roles, sign-in, test subscriptions, Run in Azure, Run locally, results |
 | `building-contica-bundles/scripts/build-template.ps1` | The build script Claude fills in for you |
 | `building-contica-bundles/scripts/check-bundle.ps1` | A checker you can also run on its own |
 
@@ -61,7 +64,8 @@ powershell -ExecutionPolicy Bypass -File check-bundle.ps1 -BundleRoot .\INT0542
 It sorts what it finds into three levels: **BLOCKING** (the tool cannot
 analyse the entity), **FIX** (something is ignored or wrong) and
 **IMPROVE** (it works, but the test plan would be richer). It also prints
-the readiness the tool's sidebar will show.
+the readiness the tool's sidebar will show and, per entity, where Run in
+Azure will send the test messages and whether Run locally works.
 
 ## Good to know
 
