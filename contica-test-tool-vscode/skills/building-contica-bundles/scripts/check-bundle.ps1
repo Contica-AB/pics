@@ -324,8 +324,49 @@ function Get-Definition($workflow) {
     return $workflow
 }
 
+# Plain parameter values from the bundle's parameters.json files, by name.
+# A name is kept only when every file that defines it gives the same plain
+# text value (not an expression, number or object); an unreadable
+# parameters.json could define anything, so then nothing is kept. Same rule
+# as the tool (versions after 2.0.0).
+function Get-BundleParameters($files) {
+    $definitions = @{}
+    foreach ($file in $files) {
+        if ([System.IO.Path]::GetFileName($file.Path) -notmatch '^parameters\.json$') { continue }
+        $json = $null
+        try { $json = (Read-Text $file.Full) | ConvertFrom-Json } catch { return @{} }
+        if (-not (Test-IsObject $json)) { return @{} }
+        foreach ($prop in $json.PSObject.Properties) {
+            $value = Get-NonEmpty (Get-Prop $prop.Value 'value')
+            $plain = if ($value -and -not (Test-HasExpression $value)) { $value } else { $null }
+            if (-not $definitions.ContainsKey($prop.Name)) { $definitions[$prop.Name] = New-Object System.Collections.Generic.List[object] }
+            $definitions[$prop.Name].Add($plain)
+        }
+    }
+    $values = @{}
+    foreach ($name in $definitions.Keys) {
+        $seen = $definitions[$name]
+        $first = $seen[0]
+        $allSame = $null -ne $first
+        foreach ($value in $seen) { if ($value -cne $first) { $allSame = $false } }
+        if ($allSame) { $values[$name] = $first }
+    }
+    return $values
+}
+
+# A name written exactly as @parameters('<name>') replaced by that
+# parameter's plain value, if the bundle has one. Returns @{ Value; From }.
+function Resolve-ParameterName($name, $parameters) {
+    if ($name -and $name -match "^@parameters\('([^']+)'\)$" -and $parameters.ContainsKey($Matches[1])) {
+        return @{ Value = $parameters[$Matches[1]]; From = $Matches[1] }
+    }
+    return @{ Value = $name; From = $null }
+}
+
 # The triggers a workflow declares, and how a test message can reach each.
-function Get-Triggers($workflow) {
+# Queue, topic, subscription and container names written as
+# @parameters('<name>') are resolved from $parameters when possible.
+function Get-Triggers($workflow, $parameters = @{}) {
     $result = New-Object System.Collections.Generic.List[object]
     $triggers = Get-Prop (Get-Definition $workflow) 'triggers'
     if (-not (Test-IsObject $triggers)) { return $result }
@@ -339,7 +380,7 @@ function Get-Triggers($workflow) {
         $provider = "$(Get-NonEmpty (Get-Prop (Get-Prop $inputs 'serviceProviderConfiguration') 'serviceProviderId'))".ToLowerInvariant()
         $connection = Get-JsonLower (Get-Prop $inputs 'host')
         $path = Get-NonEmpty (Get-Prop $inputs 'path')
-        $trigger = @{ Name = $prop.Name; Kind = 'other'; Queue = $null; Topic = $null; Subscription = $null; Container = $null; FromSetting = $false }
+        $trigger = @{ Name = $prop.Name; Kind = 'other'; Queue = $null; Topic = $null; Subscription = $null; Container = $null; FromSetting = $false; FromParameter = $null }
         if ($type -eq 'request' -or $type -eq 'httpwebhook' -or $kind -eq 'http') {
             $trigger.Kind = 'http'
         } elseif ($type -eq 'recurrence' -or $type -eq 'slidingwindow') {
@@ -355,6 +396,11 @@ function Get-Triggers($workflow) {
             if (-not $trigger.Topic -and $isTopicPath -and $segments.Count -gt 0) { $trigger.Topic = $segments[0] }
             $trigger.Subscription = Get-NonEmpty (Get-Prop $params 'subscriptionName')
             if (-not $trigger.Subscription -and $isTopicPath -and $segments.Count -gt 1) { $trigger.Subscription = $segments[1] }
+            foreach ($field in @('Queue', 'Topic', 'Subscription')) {
+                $resolved = Resolve-ParameterName $trigger[$field] $parameters
+                $trigger[$field] = $resolved.Value
+                if ($resolved.From) { $trigger.FromParameter = $resolved.From }
+            }
             foreach ($value in @($trigger.Queue, $trigger.Topic, $trigger.Subscription)) { if ($value -and $value.StartsWith('@')) { $trigger.FromSetting = $true } }
         } elseif ($provider.Contains('blob') -or $connection.Contains('azureblob')) {
             $trigger.Kind = 'blob'
@@ -363,6 +409,9 @@ function Get-Triggers($workflow) {
                 $blobPath = Get-NonEmpty (Get-Prop $params 'path')
                 if ($blobPath) { $container = $blobPath.Split('/')[0] }
             }
+            $resolved = Resolve-ParameterName $container $parameters
+            $container = $resolved.Value
+            if ($resolved.From) { $trigger.FromParameter = $resolved.From }
             $trigger.Container = $container
             if (-not $container -or $container.StartsWith('@')) { $trigger.FromSetting = $true }
         }
@@ -555,15 +604,39 @@ $NotRunLocally = @{
     'as2encode' = 'an AS2 encode step'; 'as2decode' = 'an AS2 decode step'
 }
 $TriggerWords = @{ 'blob' = 'a Blob Storage trigger'; 'schedule' = 'a schedule' }
+
+# Names resolved from parameters.json are accepted by tool versions after
+# 2.0.0 only; 2.0.0 itself refuses to send to them.
+function Get-ParameterNote($trigger) {
+    if (-not $trigger.FromParameter) { return '' }
+    return " The name comes from parameter '$($trigger.FromParameter)' in parameters.json: versions after 2.0.0 accept that, 2.0.0 refuses to send."
+}
 $ProductionWord = '(^|[^a-z0-9])(prod|prd|production)([^a-z0-9]|$)'
 
 # What testing this entity looks like: Run in Azure and Run locally, worked
 # out from its code files the way the tool does. Returns plain lines.
-function Get-TestingReport($codeFiles, [string]$where) {
-    $lines = New-Object System.Collections.Generic.List[string]
-    $workflows = New-Object System.Collections.Generic.List[object]
-    $workflowText = @{}
+# The files the Test step reads for Run in Azure: every workflow.json and
+# parameters.json inside the entity folder (listed in the manifest or not),
+# then the declared code files with those names that are not already found.
+function Get-AzureCodeFiles([string]$entityDir, $codeFiles) {
+    $files = New-Object System.Collections.Generic.List[object]
+    $found = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    Get-ChildItem -LiteralPath $entityDir -Recurse -File | Where-Object { $_.Name -match '^(workflow|parameters)\.json$' } | Sort-Object FullName | ForEach-Object {
+        [void]$found.Add($_.FullName)
+        $files.Add([pscustomobject]@{ Path = $_.FullName.Substring($entityDir.Length + 1).Replace('\', '/'); Purpose = ''; Full = $_.FullName })
+    }
     foreach ($file in $codeFiles) {
+        $full = [System.IO.Path]::GetFullPath($file.Full)
+        if ([System.IO.Path]::GetFileName($full) -match '^(workflow|parameters)\.json$' -and $found.Add($full)) { $files.Add($file) }
+    }
+    return $files
+}
+
+# The bundle workflows in a set of code files: the folder holding each
+# workflow.json names it, as in Azure.
+function Get-BundleWorkflows($files, $parameters) {
+    $workflows = New-Object System.Collections.Generic.List[object]
+    foreach ($file in $files) {
         $parts = @($file.Path -split '[\\/]' | Where-Object { $_.Length -gt 0 })
         $isWorkflow = $file.Purpose -eq 'workflow-definition' -or $file.Path -match 'workflow\.json$'
         $index = -1
@@ -574,9 +647,17 @@ function Get-TestingReport($codeFiles, [string]$where) {
         $json = $null
         try { $json = $text | ConvertFrom-Json } catch { }
         $triggers = @(); $outgoing = @()
-        if ($json) { $triggers = @(Get-Triggers $json); $outgoing = @(Get-OutgoingCalls $json) }
+        if ($json) { $triggers = @(Get-Triggers $json $parameters); $outgoing = @(Get-OutgoingCalls $json) }
         $workflows.Add(@{ Name = $name; Triggers = $triggers; Outgoing = $outgoing; Json = $json })
     }
+    return , $workflows
+}
+
+function Get-TestingReport($codeFiles, [string]$where, [string]$entityDir) {
+    $lines = New-Object System.Collections.Generic.List[string]
+    $azureFiles = Get-AzureCodeFiles $entityDir $codeFiles
+    $workflows = Get-BundleWorkflows $azureFiles (Get-BundleParameters $azureFiles)
+    $localWorkflows = Get-BundleWorkflows $codeFiles (Get-BundleParameters $codeFiles)
     if ($workflows.Count -eq 0) {
         $lines.Add('Run in Azure: no workflow.json, so the tool cannot tell which workflow to send test messages to.')
         $lines.Add("Run locally: not available. This bundle has no workflow.json, so there's nothing to run on your computer.")
@@ -596,15 +677,15 @@ function Get-TestingReport($codeFiles, [string]$where) {
                 'serviceBus' {
                     if ($t.FromSetting) {
                         $lines.Add("Run in Azure: refused. Workflow $($w.Name) reads its Service Bus queue or topic from a setting (see FIX above).")
-                        Add-Result 'FIX' $where "Workflow `"$($w.Name)`" reads its Service Bus queue or topic from a setting, so Run in Azure refuses to send to it: the bundle cannot say which one is right." 'Use Run locally for this entity. To test it in Azure, the developers must write the queue or topic name into the workflow trigger; then rebuild the bundle.'
-                    } elseif ($t.Topic) { $lines.Add("Run in Azure: workflow $($w.Name), Service Bus topic '$($t.Topic)'$(if ($t.Subscription) { ", subscription '$($t.Subscription)'" }).") }
-                    else { $lines.Add("Run in Azure: workflow $($w.Name), Service Bus queue '$($t.Queue)'.") }
+                        Add-Result 'FIX' $where "Workflow `"$($w.Name)`" reads its Service Bus queue or topic from an app setting, or from a parameter with no plain value in the bundle's parameters.json, so Run in Azure refuses to send to it: the bundle cannot say which one is right." "Use Run locally for this entity. For Run in Azure: if it is @parameters('...'), add the Logic App's parameters.json (with a plain value for that parameter) to the bundle's code; otherwise the developers must write the name into the trigger. Then rebuild the bundle."
+                    } elseif ($t.Topic) { $lines.Add("Run in Azure: workflow $($w.Name), Service Bus topic '$($t.Topic)'$(if ($t.Subscription) { ", subscription '$($t.Subscription)'" }).$(Get-ParameterNote $t)") }
+                    else { $lines.Add("Run in Azure: workflow $($w.Name), Service Bus queue '$($t.Queue)'.$(Get-ParameterNote $t)") }
                 }
                 'blob' {
                     if ($t.FromSetting) {
                         $lines.Add("Run in Azure: refused. Workflow $($w.Name) reads its Blob container from a setting (see FIX above).")
-                        Add-Result 'FIX' $where "Workflow `"$($w.Name)`" reads its Blob container from a setting, so Run in Azure refuses to send to it: the bundle cannot say which one is right." 'To test it in Azure, the developers must write the container name into the workflow trigger; then rebuild the bundle. (Run locally does not support Blob triggers.)'
-                    } else { $lines.Add("Run in Azure: workflow $($w.Name), Blob container '$($t.Container)'.") }
+                        Add-Result 'FIX' $where "Workflow `"$($w.Name)`" reads its Blob container from an app setting, or from a parameter with no plain value in the bundle's parameters.json, so Run in Azure refuses to send to it: the bundle cannot say which one is right." "If it is @parameters('...'), add the Logic App's parameters.json (with a plain value for that parameter) to the bundle's code; otherwise the developers must write the name into the trigger. Then rebuild the bundle. (Run locally does not support Blob triggers.)"
+                    } else { $lines.Add("Run in Azure: workflow $($w.Name), Blob container '$($t.Container)'.$(Get-ParameterNote $t)") }
                 }
             }
         }
@@ -621,11 +702,14 @@ function Get-TestingReport($codeFiles, [string]$where) {
     # Run locally
     $reason = $null
     $local = $null
-    if ($receiving.Count -ne 1) {
-        if ($receiving.Count -eq 0) { $reason = 'No workflow in this bundle can receive a test message, so there is nothing to run.' }
-        else { $reason = "This bundle has more than one workflow that receives messages ($(($receiving | ForEach-Object { $_.Name }) -join ', ')). Running locally supports one for now." }
+    $localReceiving = @(Get-ReceivingWorkflows $localWorkflows)
+    if ($localWorkflows.Count -eq 0) {
+        $reason = "This bundle has no workflow.json, so there's nothing to run on your computer."
+    } elseif ($localReceiving.Count -ne 1) {
+        if ($localReceiving.Count -eq 0) { $reason = 'No workflow in this bundle can receive a test message, so there is nothing to run.' }
+        else { $reason = "This bundle has more than one workflow that receives messages ($(($localReceiving | ForEach-Object { $_.Name }) -join ', ')). Running locally supports one for now." }
     } else {
-        $local = $receiving[0]
+        $local = $localReceiving[0]
         if ($null -eq $local.Json) { $reason = "The workflow $($local.Name) could not be read." }
         elseif ($local.Triggers.Count -ne 1) { $reason = "$($local.Name) has $($local.Triggers.Count) triggers. Running locally supports a workflow with one." }
         elseif (@('http', 'serviceBus') -notcontains $local.Triggers[0].Kind) {
@@ -919,7 +1003,7 @@ foreach ($dir in $entityDirs) {
     if ($missing.Count -gt 0) { $detail += "; missing $($missing -join ', ')" }
     $detail += "; $mappingFilesWithRules spreadsheet(s) with source and target column headers"
     $readinessByEntity[$where] = "$readiness, $score of 5 ($detail)"
-    $testingByEntity[$where] = @(Get-TestingReport $codeFiles $where)
+    $testingByEntity[$where] = @(Get-TestingReport $codeFiles $where $dir.FullName)
 
     # Files that sit in the entity folder but are not in the manifest are never read.
     Get-ChildItem -LiteralPath $dir.FullName -Recurse -File | Where-Object { $_.Name -ne 'manifest.json' -and -not $declared.Contains($_.FullName) } | ForEach-Object {

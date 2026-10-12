@@ -24,7 +24,7 @@ Analyse and Generate need no Azure access. Test needs a generated pack.
 | `code/{workflow name}/workflow.json`, purpose `workflow-definition` | The folder name is how the tool finds the workflow in Azure. Without any `workflow.json` nothing can be sent, and Run locally is not offered. |
 | The workflow that receives messages from outside | Test messages go to it. A workflow that only another bundle workflow calls is never sent to directly. When the first workflow starts on a schedule, the messages go to the workflows it calls (as a child workflow, through their HTTP trigger address, or through the queue or container they listen on), so those must be in the bundle too. `check-bundle.ps1` names the workflow the messages will go to. |
 | A trigger the tool can send to | HTTP (Request), Service Bus (queue or topic), or Blob. A schedule cannot be sent to. |
-| Queue, topic or container **written out** in the trigger | In 2.0.0, when the trigger reads its Service Bus queue or topic, or its Blob container, from a setting or parameter (`@parameters(...)`, `@appsetting(...)`), Run in Azure refuses to send: the bundle cannot say which one is right. Run locally still works. |
+| Queue, topic or container the bundle can name | Written out in the trigger, or written as exactly `@parameters('name')` with a plain value for that parameter in the Logic App's `parameters.json`, included in the bundle's code (versions after 2.0.0; 2.0.0 refuses parameters too). A name from an app setting (`@appsetting(...)`), a parameter with no plain value, or one that two `parameters.json` files give differently, makes Run in Azure refuse to send: the bundle cannot say which one is right. Run locally still works. |
 | Logic App maps (`.xslt`, `.liquid`) under `code`, purpose `transformation`, original file name | Run locally runs the maps the workflow calls only when they are in the bundle under that name. |
 | `parameters.json` (optional, no secrets) | Run locally uses it, with addresses and secrets replaced; without it every parameter is "placeholder". |
 
@@ -114,7 +114,7 @@ bundle's workflow. The tool then checks, and refuses to send when:
 - the workflow is not one of the bundle's, or not the receiving one;
 - the way in does not match the workflow's trigger (trigger name, queue,
   topic or container);
-- the queue, topic or container comes from a setting (see above);
+- the queue, topic or container comes from an app setting, or from a parameter the bundle cannot resolve (see above);
 - the subscription is not allowed in this environment;
 - the Logic App, workflow, namespace or account cannot be found in Azure.
 
@@ -182,7 +182,7 @@ SDK. Nothing is sent to Azure.
 | "None of your Azure subscriptions is allowed for ..." | Add the subscription under Test subscriptions. |
 | "No matching Logic App" | No Logic App in that subscription runs a workflow named like the bundle's folder. Check the folder name, or the subscription. |
 | "Could not get the trigger address" | The tester lacks Logic Apps Standard Operator (Reader is not enough). |
-| "... reads its Service Bus queue or topic from a setting ..." | 2.0.0 limitation, see above. Use Run locally, or a workflow with the name written out. |
+| "... reads its Service Bus queue or topic from an app setting, or from a parameter ..." (2.0.0: "... from a setting ...") | Add the Logic App's `parameters.json` to the bundle's code when the name is `@parameters('...')` (versions after 2.0.0). Otherwise use Run locally, or ask the developers to write the name into the trigger. |
 | ".NET 10 SDK" message | Install the .NET 10 SDK. |
 | "The extension's storage folder is too long ..." | The Windows user profile path is very long; see Run locally above. |
 | "Cannot approve ...: N blocking gap(s) must be resolved first." | Resolve the blocking gaps in the Analyse tab, see "The order of the work". |

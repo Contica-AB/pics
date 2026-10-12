@@ -122,8 +122,10 @@ section**:
     `main-documentation`. Join several files into one only when an entity's
     own text is split over several pages (`From = @(...)`);
   - leave out `host.json`, deployment files and anything holding secrets.
-    `parameters.json` may go in as `infrastructure` when it holds only
-    references (`@appsetting(...)`), no secrets.
+    `parameters.json` may go in as `infrastructure` when it holds no
+    secrets. Include it when a trigger names its queue, topic or container as
+    `@parameters('...')`: the tool reads the name from it (versions after
+    2.0.0).
 - `$RunHistory` when examples come from a Logic App's run history.
 
 Show the person the source-to-bundle table and ask about anything unclear
